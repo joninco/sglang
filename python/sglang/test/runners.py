@@ -25,10 +25,14 @@ from transformers import (
     AutoConfig,
     AutoModel,
     AutoModelForCausalLM,
-    AutoModelForVision2Seq,
     AutoProcessor,
     GenerationConfig,
 )
+
+try:
+    from transformers import AutoModelForImageTextToText
+except ImportError:
+    from transformers import AutoModelForVision2Seq as AutoModelForImageTextToText
 
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.model_loader.ci_weight_validation import ci_validate_and_clean_hf_cache
@@ -274,7 +278,7 @@ class HFRunner:
             ).to(get_device())
         elif self.model_type == "embedding":
             if "gme-qwen2-vl" in model_path.lower():
-                self.model = AutoModelForVision2Seq.from_pretrained(
+                self.model = AutoModelForImageTextToText.from_pretrained(
                     model_path,
                     torch_dtype=torch_dtype,
                     trust_remote_code=False,
