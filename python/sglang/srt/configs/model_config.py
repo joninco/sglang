@@ -1018,9 +1018,10 @@ class ModelConfig:
 
         required_version = version.parse("5.0.0dev0")
         if tf_version < required_version and needs_tf_v5:
+            type_info = f" (model_type={model_type})" if model_type else ""
             raise ValueError(
-                f"Transformers version {tf_version_str} is not supported for model {self.model_path} "
-                f"or model type {model_type}. "
+                f"Transformers version {tf_version_str} is not supported for model "
+                f"{self.model_path}{type_info}. "
                 "Please upgrade transformers to >= 5.0.0."
             )
 
