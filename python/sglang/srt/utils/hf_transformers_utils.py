@@ -560,6 +560,13 @@ def get_tokenizer(
             "slowdown. Consider using a fast tokenizer instead."
         )
 
+    if not kwargs.get("use_fast", True):
+        if isinstance(tokenizer, PreTrainedTokenizerFast):
+            logger.info(
+                "Requested slow tokenizer but received fast tokenizer "
+                "(transformers v5 may not have a slow version for this model)"
+            )
+
     attach_additional_stop_token_ids(tokenizer)
     tokenizer = patch_tokenizer(tokenizer)
     return tokenizer
