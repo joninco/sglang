@@ -1,0 +1,4 @@
+FROM sglang-blackwell:sm120a
+RUN pip install --quiet --no-cache-dir \
+    "transformers>=5.2.0" \
+    accelerate

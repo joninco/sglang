@@ -1,0 +1,301 @@
+# Dockerfile for sglang with Blackwell (sm_120a) support
+# Based on the main Dockerfile with modifications for RTX PRO 6000 / RTX 50xx series
+
+ARG CUDA_VERSION=12.9.1
+ARG TORCH_CUDA_ARCH_LIST=12.0a
+ARG FLASHINFER_CUDA_ARCH_LIST=12.0a
+ARG BUILD_SGL_KERNEL_FROM_SOURCE=1
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
+
+ARG TORCH_CUDA_ARCH_LIST
+ARG FLASHINFER_CUDA_ARCH_LIST
+ARG BUILD_SGL_KERNEL_FROM_SOURCE
+ARG TARGETARCH
+ARG BUILD_TYPE=all
+ARG BRANCH_TYPE=remote
+ARG GRACE_BLACKWELL=0
+ARG HOPPER_SBO=0
+
+ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
+ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
+ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
+ARG BUILD_AND_DOWNLOAD_PARALLEL=8
+ARG SGL_KERNEL_VERSION=0.3.20
+ARG SGL_VERSION
+ARG USE_LATEST_SGLANG=0
+ARG GDRCOPY_VERSION=2.5.1
+ARG PIP_DEFAULT_INDEX
+ARG UBUNTU_MIRROR
+ARG GITHUB_ARTIFACTORY=github.com
+ARG INSTALL_FLASHINFER_JIT_CACHE=1
+ARG FLASHINFER_VERSION=0.6.2
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    CUDA_VERSION=${CUDA_VERSION} \
+    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
+    FLASHINFER_VERSION=${FLASHINFER_VERSION} \
+    # ===== BLACKWELL SM_120A SUPPORT =====
+    # Enable flashinfer JIT compilation for Blackwell architecture
+    FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
+    # Force PyTorch to include sm_120
+    TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
+    # Build optimization: use MAX_JOBS for parallel compilation, disable NVCC_THREADS
+    MAX_JOBS=128 \
+    NVCC_THREADS=1
+
+# Add GKE default lib and bin locations
+ENV PATH="${PATH}:/usr/local/nvidia/bin" \
+    LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+
+# Replace Ubuntu sources if specified
+RUN if [ -n "$UBUNTU_MIRROR" ]; then \
+    sed -i "s|http://.*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
+    sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
+fi
+
+# Python setup
+RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
+    apt update && apt install -y --no-install-recommends wget software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt install -y --no-install-recommends python3.12-full python3.12-dev python3.10-venv \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
+    && update-alternatives --set python3 /usr/bin/python3.12 \
+    && wget -q https://bootstrap.pypa.io/get-pip.py \
+    && python3 get-pip.py --break-system-packages \
+    && rm get-pip.py \
+    && rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED
+
+# Install system dependencies
+RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
+    apt update && apt install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    curl \
+    unzip \
+    libnuma-dev \
+    libibverbs-dev \
+    librdmacm-dev \
+    numactl \
+    ninja-build \
+    ccache \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install a newer CMake when building sgl-kernel from source (CMake >= 3.31 required)
+RUN if [ "${BUILD_SGL_KERNEL_FROM_SOURCE}" = "1" ]; then \
+      CMAKE_VERSION=3.31.1; \
+      ARCH=$(uname -m); \
+      curl -fsSL -o /tmp/cmake.tgz https://cmake.org/files/v3.31/cmake-${CMAKE_VERSION}-linux-${ARCH}.tar.gz; \
+      tar -xzf /tmp/cmake.tgz -C /opt; \
+      ln -s /opt/cmake-${CMAKE_VERSION}-linux-${ARCH} /opt/cmake; \
+      rm -f /tmp/cmake.tgz; \
+    fi
+
+# Framework stage
+FROM base AS framework
+
+ARG BUILD_TYPE
+ARG BRANCH_TYPE
+ARG CUDA_VERSION
+ARG SGL_KERNEL_VERSION
+ARG SGL_VERSION
+ARG USE_LATEST_SGLANG
+ARG GITHUB_ARTIFACTORY
+ARG INSTALL_FLASHINFER_JIT_CACHE
+ARG FLASHINFER_VERSION
+ARG GRACE_BLACKWELL
+ARG GRACE_BLACKWELL_DEEPEP_BRANCH
+ARG HOPPER_SBO
+ARG HOPPER_SBO_DEEPEP_COMMIT
+ARG DEEPEP_COMMIT
+ARG BUILD_AND_DOWNLOAD_PARALLEL
+ARG TORCH_CUDA_ARCH_LIST
+ARG FLASHINFER_CUDA_ARCH_LIST
+ARG BUILD_SGL_KERNEL_FROM_SOURCE
+
+WORKDIR /sgl-workspace
+
+# Clone sglang
+RUN set -eux; \
+    if [ "$BRANCH_TYPE" = "remote" ]; then \
+        if [ "$USE_LATEST_SGLANG" = "1" ]; then \
+            git clone --depth=1 https://${GITHUB_ARTIFACTORY}/sgl-project/sglang.git; \
+        else \
+            git clone --depth=1 --branch v${SGL_VERSION} https://${GITHUB_ARTIFACTORY}/sgl-project/sglang.git; \
+        fi \
+    ; fi
+
+# Copy local source if building locally
+COPY --from=base /usr/bin/python3 /usr/bin/python3
+COPY . /sgl-workspace/sglang/
+
+WORKDIR /sgl-workspace/sglang
+
+# Install PyTorch and dependencies
+# Pin versions to match sglang requirements to avoid install/uninstall churn
+RUN --mount=type=cache,target=/root/.cache/pip \
+    case "$CUDA_VERSION" in \
+        12.6.1) CUINDEX=126 ;; \
+        12.8.1) CUINDEX=128 ;; \
+        12.9.1) CUINDEX=129 ;; \
+        13.0.1) CUINDEX=130 ;; \
+        *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
+    esac \
+    && python3 -m pip install torch==2.9.1 torchvision torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu${CUINDEX}
+
+# Install sgl-kernel (wheel) unless we build from source later
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "${BUILD_SGL_KERNEL_FROM_SOURCE}" = "1" ]; then \
+        echo "Skipping sgl-kernel wheel install (will build from source)."; \
+    else \
+        case "$CUDA_VERSION" in \
+            12.6.1) CUINDEX=126 ;; \
+            12.8.1) CUINDEX=128 ;; \
+            12.9.1) CUINDEX=129 ;; \
+            13.0.1) CUINDEX=130 ;; \
+        esac \
+        && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
+            python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps; \
+        elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
+            python3 -m pip install sgl-kernel==${SGL_KERNEL_VERSION}; \
+        elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
+            python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps; \
+        fi; \
+    fi
+
+# Install sglang and flashinfer
+RUN --mount=type=cache,target=/root/.cache/pip \
+    case "$CUDA_VERSION" in \
+        12.6.1) CUINDEX=126 ;; \
+        12.8.1) CUINDEX=128 ;; \
+        12.9.1) CUINDEX=129 ;; \
+        13.0.1) CUINDEX=130 ;; \
+    esac \
+    && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+    && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
+        python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX}; \
+    fi \
+    # Download flashinfer cubins (may fail for sm_120, that's OK - JIT will compile)
+    && FLASHINFER_DISABLE_VERSION_CHECK=1 FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin || true
+
+# ===== UPGRADE CUDNN FOR PYTORCH 2.9.1 COMPATIBILITY =====
+# PyTorch 2.9.1 has a bug with nn.Conv3d when using CuDNN < 9.15
+# See: https://github.com/pytorch/pytorch/issues/168167
+RUN python3 -m pip install nvidia-cudnn-cu12==9.16.0.29
+
+# ===== PATCH FLASHINFER FOR SM_120 (BLACKWELL) =====
+# The flashinfer JIT comm.py hardcodes supported_major_versions=[9, 10]
+# We need to add 12 for Blackwell support
+RUN FLASHINFER_COMM_PY=$(FLASHINFER_DISABLE_VERSION_CHECK=1 python3 -c "import flashinfer; import os; print(os.path.join(os.path.dirname(flashinfer.__file__), 'jit', 'comm.py'))") \
+    && if [ -f "$FLASHINFER_COMM_PY" ]; then \
+        echo "Patching $FLASHINFER_COMM_PY for Blackwell sm_120 support..." \
+        && sed -i 's/supported_major_versions=\[9, 10\]/supported_major_versions=[9, 10, 12]/g' "$FLASHINFER_COMM_PY" \
+        && grep -n "supported_major_versions" "$FLASHINFER_COMM_PY" || true; \
+    fi
+
+# ===== DISABLE FLASHINFER ALLREDUCE FUSION FOR SM_120 =====
+# The TRT-LLM allreduce kernels in flashinfer aren't compiled for sm_120
+# Force disable enable_flashinfer_allreduce_fusion in server_args.py
+RUN SGLANG_ARGS_PY=$(FLASHINFER_DISABLE_VERSION_CHECK=1 python3 -c "import sglang.srt.server_args; import os; print(os.path.abspath(sglang.srt.server_args.__file__))") \
+    && echo "Patching $SGLANG_ARGS_PY to disable flashinfer allreduce fusion for sm_120..." \
+    && sed -i 's/enable_flashinfer_allreduce_fusion: bool = False/enable_flashinfer_allreduce_fusion: bool = False  # Forced False for sm_120/g' "$SGLANG_ARGS_PY" \
+    && sed -i 's/self.enable_flashinfer_allreduce_fusion = True/pass  # Disabled for sm_120 - TRT-LLM kernels not compiled/g' "$SGLANG_ARGS_PY"
+
+# Build sgl-kernel from source (ensures sm_120a kernels are included)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "${BUILD_SGL_KERNEL_FROM_SOURCE}" = "1" ]; then \
+        python3 -m pip install scikit-build-core uv ninja; \
+        cd /sgl-workspace/sglang/sgl-kernel; \
+        export PATH="/opt/cmake/bin:${PATH}"; \
+        CUDA_VERSION="${CUDA_VERSION}" \
+        MAX_JOBS="${BUILD_AND_DOWNLOAD_PARALLEL}" \
+        CMAKE_BUILD_PARALLEL_LEVEL="${BUILD_AND_DOWNLOAD_PARALLEL}" \
+        MAKEFLAGS="-j${BUILD_AND_DOWNLOAD_PARALLEL}" \
+        NINJAFLAGS="-j${BUILD_AND_DOWNLOAD_PARALLEL}" \
+        CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL}" \
+        make build; \
+    fi
+
+# Clone and install DeepEP with sm_120 support
+WORKDIR /sgl-workspace
+
+RUN set -eux; \
+    if [ "$GRACE_BLACKWELL" = "1" ]; then \
+      git clone https://github.com/fzyzcjy/DeepEP.git && \
+      cd DeepEP && \
+      git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
+      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+      cd .. ; \
+    elif [ "$HOPPER_SBO" = "1" ]; then \
+      git clone https://github.com/deepseek-ai/DeepEP.git -b antgroup-opt && \
+      cd DeepEP && \
+      git checkout ${HOPPER_SBO_DEEPEP_COMMIT} && \
+      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+      cd .. ; \
+    else \
+        curl --retry 3 --retry-delay 2 -fsSL -o ${DEEPEP_COMMIT}.zip \
+            https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip && \
+        unzip -q ${DEEPEP_COMMIT}.zip && rm ${DEEPEP_COMMIT}.zip && mv DeepEP-${DEEPEP_COMMIT} DeepEP && cd DeepEP && \
+        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+        cd .. ; \
+    fi
+
+# Install DeepEP with Blackwell sm_120 support
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd DeepEP && \
+    if [ -n "${TORCH_CUDA_ARCH_LIST}" ]; then \
+        CHOSEN_TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}"; \
+    else \
+        case "$CUDA_VERSION" in \
+            12.6.1) \
+                CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
+                ;; \
+            12.8.1) \
+                CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
+                ;; \
+            12.9.1) \
+                # ===== ADDED 12.0 FOR BLACKWELL SM_120A ===== \
+                CHOSEN_TORCH_CUDA_ARCH_LIST='12.0a' \
+                ;; \
+            13.0.1) \
+                # For CUDA 13.0, use sm_120f instead of sm_120a \
+                CHOSEN_TORCH_CUDA_ARCH_LIST='12.0a' \
+                ;; \
+            *) \
+                echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
+                ;; \
+        esac; \
+    fi && \
+    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+        sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
+    fi && \
+    TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation .
+
+# Install additional Python packages
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install \
+    datamodel_code_generator \
+    fastsafetensors \
+    pre-commit \
+    pytest \
+    black \
+    isort \
+    uv \
+    wheel
+
+# Fix Triton to use system ptxas for newer architectures
+RUN if [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
+    rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
+    ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
+fi
+
+# Set working directory
+WORKDIR /sgl-workspace/sglang
+
+# Expose port
+EXPOSE 8000
+
+# Default command
+CMD ["python3", "-m", "sglang.launch_server", "--help"]
