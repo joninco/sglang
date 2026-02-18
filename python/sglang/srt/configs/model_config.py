@@ -440,22 +440,30 @@ class ModelConfig:
                 if is_deepseek_nsa(self.hf_text_config)
                 else None
             )
-            # Handle rope scaling
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            # in transformers v5, rope_scaling is just rope_parameters for backward compatibility
-            rope_scaling = self.hf_text_config.rope_scaling
-            if rope_scaling:
-                # v5 uses "rope_type", v4 uses "type"
-                rope_type = (
-                    rope_scaling.get("rope_type")
-                    or rope_scaling.get("type")
-                    or "default"
+
+            if "Glm4MoeLiteForCausalLM" in self.hf_config.architectures:
+                self.scaling = 1
+                self.hf_config.rope_scaling = None
+            else:
+                # Handle rope scaling
+                self.scaling = 1 / math.sqrt(
+                    self.qk_nope_head_dim + self.qk_rope_head_dim
                 )
-                if rope_type != "default":
-                    mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
-                    scaling_factor = rope_scaling["factor"]
-                    mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-                    self.scaling = self.scaling * mscale * mscale
+                # in transformers v5, rope_scaling is just rope_parameters for backward compatibility
+                rope_scaling = self.hf_text_config.rope_scaling
+                if rope_scaling:
+                    # v5 uses "rope_type", v4 uses "type"
+                    rope_type = (
+                        rope_scaling.get("rope_type")
+                        or rope_scaling.get("type")
+                        or "default"
+                    )
+                    if rope_type != "default":
+                        mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
+                        scaling_factor = rope_scaling["factor"]
+                        mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                        self.scaling = self.scaling * mscale * mscale
+
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -880,6 +888,12 @@ class ModelConfig:
         }
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
+
+        # Draft models with explicit unquant (quantization=None) should skip
+        # HF quant auto-detection — the MTP weights may be unquantized even
+        # though the main model checkpoint has a quantization_config.
+        if self.is_draft_model and self.quantization is None:
+            return
 
         # Parse quantization method from the HF and ModelSlim model config, if available.
         # Only one function should return config, other should return None.

@@ -23,6 +23,14 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         if kwargs.get("rope_scaling") is None and rope_parameters is not None:
             kwargs["rope_scaling"] = rope_parameters
 
+        # Extract rope_theta from rope_parameters when not set as top-level kwarg.
+        # The model's config.json may only have rope_theta inside rope_parameters.
+        if rope_parameters is not None and kwargs.get("rope_theta") is None:
+            rp_theta = rope_parameters.get("rope_theta")
+            if rp_theta is not None:
+                kwargs["rope_theta"] = rp_theta
+
+
         super().__init__(**kwargs)
         if self.rope_scaling is None:
             self.rope_scaling = rope_parameters or {}

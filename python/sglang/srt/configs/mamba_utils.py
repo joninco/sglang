@@ -45,21 +45,6 @@ class Mamba2StateDType:
 
 
 def mamba2_state_dtype(config=None) -> Mamba2StateDType:
-    """
-    Get mamba2 state dtype from config or environment variable.
-
-    Priority (from highest to lowest):
-    1. Environment variable SGLANG_MAMBA_SSM_DTYPE
-    2. Config file (config.mamba_ssm_dtype or config.text_config.mamba_ssm_dtype)
-    3. Default "float32"
-
-    Args:
-        config: Optional config object (PretrainedConfig). If provided, will read
-                mamba_ssm_dtype from it. For VL models, reads from text_config.
-
-    Returns:
-        Mamba2StateDType with conv and temporal dtypes
-    """
     dtype_map = {
         "float32": torch.float32,
         "bfloat16": torch.bfloat16,
@@ -68,18 +53,16 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
     conv_dtype = dtype_map.get(envs.SGLANG_MAMBA_CONV_DTYPE.get(), torch.bfloat16)
 
     # Get SSM dtype: default -> config -> env var
-    ssm_dtype = torch.float32  # Step 1: Default value
+    ssm_dtype = torch.float32
 
-    # Step 2: Try to read from config
+    # Try to read from config
     if config is not None:
         config_dtype = None
         if hasattr(config, "text_config") and hasattr(
             config.text_config, "mamba_ssm_dtype"
         ):
-            # VL model: read from text_config
             config_dtype = config.text_config.mamba_ssm_dtype
         elif hasattr(config, "mamba_ssm_dtype"):
-            # Text model: read from root config
             config_dtype = config.mamba_ssm_dtype
 
         if config_dtype is not None:
@@ -91,7 +74,7 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
             else:
                 ssm_dtype = dtype_map[config_dtype]
 
-    # Step 3: Check environment variable, if not None, override
+    # Environment variable overrides config
     env_ssm_dtype = envs.SGLANG_MAMBA_SSM_DTYPE.get()
     if env_ssm_dtype is not None:
         if env_ssm_dtype not in dtype_map:

@@ -311,21 +311,30 @@ class ModelOptQuantConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
-    def apply_weight_name_mapper(
-        self, hf_to_sglang_mapper: "WeightsMapper"
-    ):  # noqa: B027
-        # Map excluded module patterns from HF layout to sglang layout.
-        # Ref: HF hf_quant_config.json for nvidia/Kimi-K2.5-NVFP4
-        # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/hf_quant_config.json
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
         if self.exclude_modules:
-            mapped = hf_to_sglang_mapper.apply_list(self.exclude_modules)
-            expanded: List[str] = []
-            for name in mapped:
-                expanded.append(name)
-                if name.startswith("language_model."):
-                    expanded.append(name.removeprefix("language_model."))
-            # Preserve order, drop duplicates.
-            self.exclude_modules = list(dict.fromkeys(expanded))
+            self.exclude_modules = [
+                self._remap_wildcard_name(m, hf_to_sglang_mapper)
+                for m in self.exclude_modules
+            ]
+        if self.packed_modules_mapping:
+            self.packed_modules_mapping = hf_to_sglang_mapper.apply_dict(
+                self.packed_modules_mapping
+            )
+
+    @staticmethod
+    def _remap_wildcard_name(name: str, mapper: "WeightsMapper") -> str:
+        """Remap a module name through a WeightsMapper, preserving wildcards.
+
+        Temporarily replaces ``*`` with a dotted sentinel so _map_name's
+        longest-prefix matching isn't short-circuited (e.g. "model.visual*"
+        won't fall through to the shorter "model." prefix).
+        """
+        _SENTINEL = ".__wildcard__"
+        mapped = mapper._map_name(name.replace("*", _SENTINEL))
+        if mapped is not None:
+            return mapped.replace(_SENTINEL, "*")
+        return name
 
     def is_layer_excluded(self, prefix: str) -> bool:
         """Check if a layer should be excluded from quantization.
@@ -1049,6 +1058,20 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     "Cannot find 'quant_algo' in the model's quantization config. "
                     "Expected either flat format (config.json) or nested format (hf_quant_config.json)."
                 )
+
+        # Normalize exclude_modules: HF checkpoints use "model.language_model."
+        # prefix but SGLang strips it during weight loading. Add both variants
+        # so is_layer_excluded matches regardless of which prefix is used.
+        if exclude_modules:
+            expanded: List[str] = []
+            for name in exclude_modules:
+                expanded.append(name)
+                if "model.language_model." in name:
+                    expanded.append(
+                        name.replace("model.language_model.", "model.")
+                    )
+            # Preserve order, drop duplicates
+            exclude_modules = list(dict.fromkeys(expanded))
 
         if not quant_method in ["FP8", "NVFP4"]:
             raise ValueError(

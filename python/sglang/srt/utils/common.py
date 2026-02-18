@@ -2822,16 +2822,35 @@ def retry(
 
 
 def has_hf_quant_config(model_path: str) -> bool:
-    """Check if the model path contains hf_quant_config.json file.
+    """Check if the model has pre-quantized weights.
+
+    Checks for:
+    1. A standalone hf_quant_config.json file
+    2. A quantization_config section in config.json with quantized weights present
 
     Args:
         model_path: Path to the model, can be local path or remote URL.
 
     Returns:
-        True if hf_quant_config.json exists, False otherwise.
+        True if model is already quantized, False otherwise.
     """
     if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
         return True
+
+    # Check for quantization_config in config.json with actual quantized weights
+    config_path = os.path.join(model_path, "config.json")
+    if os.path.exists(config_path):
+        try:
+            import json
+
+            with open(config_path) as f:
+                config = json.load(f)
+            quant_config = config.get("quantization_config", {})
+            if quant_config.get("quant_method") in ("modelopt",):
+                return True
+        except Exception:
+            pass
+
     try:
         from huggingface_hub import HfApi
 
