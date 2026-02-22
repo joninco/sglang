@@ -58,7 +58,10 @@ def sample_openai_requests(
         # This includes the messages but not the tools
         prompt_len = len(
             tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=False,
             )
         )
 
