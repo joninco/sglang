@@ -169,6 +169,12 @@ class AnthropicServing:
                 system_parts = []
                 for block in anthropic_request.system:
                     if block.type == "text" and block.text:
+                        # Skip per-request billing/analytics metadata that
+                        # is not meaningful to the model. Including it in the
+                        # system prompt changes the token prefix on every
+                        # request, which defeats RadixAttention prefix caching.
+                        if block.text.startswith("x-anthropic-billing-header"):
+                            continue
                         system_parts.append(block.text)
                 system_text = "\n".join(system_parts)
                 openai_messages.append({"role": "system", "content": system_text})
